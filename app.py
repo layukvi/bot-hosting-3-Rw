@@ -186,18 +186,6 @@ def format_countdown(countdown_str: str) -> str:
     except:
         return countdown_str
 
-# 提取倒计时（兼容 'Renew in 21:33:24' 和新版 'Renewal cooldown 21:33:24'）
-def extract_countdown(text: str) -> str:
-    patterns = [
-        r"(?:Renew in|Renewal cooldown)\s*[:\-]?\s*(\d{1,2}:\d{2}:\d{2})",
-        r"cooldown\s*[:\-]?\s*(\d{1,2}:\d{2}:\d{2})",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            return match.group(1)
-    return None
-
 # 获取过期日期
 def extract_expiry_date(page_source: str) -> str:
     patterns = [
@@ -414,6 +402,7 @@ def main():
         # 方式1: SESSION_TOKEN Cookie 登录（默认）
         if SESSION_TOKEN:
             print("🚀 启动浏览器...")
+            # 必须使用 uc_open_with_reconnect 隐藏 WebDriver 特征
             sb.uc_open_with_reconnect("https://bot-hosting.net/", reconnect_time=3)
             sb.sleep(2)
 
@@ -476,9 +465,9 @@ def main():
         else:
             print("⚠️ 未能提取当前到期日期")
 
-        # 寻找外部续期按钮或冷却倒计时
+        # 寻找外部续期按钮
         outer_renew_selector = None
-        countdown_text = extract_countdown(page_source)
+        countdown_text = None
         possible_selectors = [
             'button:contains("Renew")',
             'button:contains("Renew free plan")',
@@ -490,13 +479,13 @@ def main():
         for selector in possible_selectors:
             try:
                 if sb.is_element_visible(selector):
-                    button_text = sb.get_text(selector).strip()
-                    cd_match = extract_countdown(button_text)
-                    if cd_match or "cooldown" in button_text.lower() or "renew in" in button_text.lower():
-                        if cd_match:
-                            countdown_text = cd_match
+                    button_text = sb.get_text(selector)
+                    if "Renew in" in button_text:
+                        match = re.search(r"Renew in (\d{2}:\d{2}:\d{2})", button_text)
+                        if match:
+                            countdown_text = match.group(1)
                         break
-                    elif "renew" in button_text.lower():
+                    elif "Renew" in button_text and "in" not in button_text.lower():
                         outer_renew_selector = selector
                         print(f"✅ 续期按钮可用: '{button_text}'")
                         break
@@ -508,6 +497,7 @@ def main():
             print("🔄 点击外部续期按钮，等待验证窗口...")
             try:
                 sb.sleep(2)
+                # 使用 uc_click 避免点击时暴露 WebDriver 痕迹
                 try:
                     sb.uc_click(outer_renew_selector, reconnect_time=4)
                 except Exception:
@@ -522,6 +512,7 @@ def main():
             print("🔒 检测弹窗中的 Turnstile 验证...")
             turnstile_passed = False
 
+            # 先静默等待 5 秒看是否已经自动无感通过
             if wait_for_turnstile_pass(sb, timeout=5):
                 turnstile_passed = True
 
@@ -529,6 +520,7 @@ def main():
                 for attempt in range(1, 5):
                     try:
                         print(f"🖱️ 尝试点击 Turnstile 验证框 (第 {attempt} 次)...")
+                        # 奇数次使用 GUI 物理点击，偶数次尝试 handle_captcha
                         if attempt % 2 == 1:
                             sb.uc_gui_click_captcha()
                         else:
@@ -564,17 +556,18 @@ def main():
             # 提取新的到期日期和倒计时（若首次未检测到变化，主动刷新页面再试一次）
             new_page_text = sb.get_page_source()
             new_expiry = extract_expiry_date(new_page_text)
-            new_countdown = extract_countdown(new_page_text)
+            new_match = re.search(r"Renew in (\d{2}:\d{2}:\d{2})", new_page_text)
 
-            if not new_countdown and (not new_expiry or new_expiry == current_expiry):
+            if not new_match and (not new_expiry or new_expiry == current_expiry):
                 print("🔄 页面状态暂未刷新，重新加载账单页确认结果...")
                 sb.uc_open_with_reconnect("https://bot-hosting.net/a/billings", reconnect_time=4)
                 sb.sleep(5)
                 new_page_text = sb.get_page_source()
                 new_expiry = extract_expiry_date(new_page_text)
-                new_countdown = extract_countdown(new_page_text)
+                new_match = re.search(r"Renew in (\d{2}:\d{2}:\d{2})", new_page_text)
 
-            if new_countdown:
+            if new_match:
+                new_countdown = new_match.group(1)
                 print(f"✅ 续期成功！新的倒计时: {new_countdown}")
                 if new_expiry:
                     print(f"📅 新的到期日期: {new_expiry}")
