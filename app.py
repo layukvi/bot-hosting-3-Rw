@@ -79,7 +79,7 @@ def dismiss_overlays(sb):
         try {
             var consentBtn = document.querySelector('.fc-cta-consent, button.fc-button.fc-cta-consent');
             if (consentBtn) { consentBtn.click(); }
-            var overlays = document.querySelectorAll('.fc-consent-root, .fc-dialog-overlay, .fc-dialog-container, ins.adsbygoogle[ data-vignette-loaded="true"]');
+            var overlays = document.querySelectorAll('.fc-consent-root, .fc-dialog-overlay, .fc-dialog-container, ins.adsbygoogle[data-vignette-loaded="true"]');
             overlays.forEach(function(el) { el.remove(); });
             if (document.body) {
                 document.body.style.overflow = 'auto';
@@ -87,8 +87,8 @@ def dismiss_overlays(sb):
         } catch(e) {}
     """)
 
-# 派发完整的鼠标事件序列 (兼容 React/Vue 合成事件)
-def dispatch_react_click(sb, selector_or_js_el):
+# 派发完整的鼠标事件序列 (兼容 Svelte/React/Vue 事件绑定)
+def dispatch_mouse_sequence(sb, selector_or_js_el):
     return js(sb, f"""
         var el = {selector_or_js_el};
         if (!el) return false;
@@ -102,7 +102,8 @@ def dispatch_react_click(sb, selector_or_js_el):
                 view: window,
                 clientX: cx,
                 clientY: cy,
-                button: 0
+                button: 0,
+                buttons: 1
             }});
             el.dispatchEvent(evt);
         }});
@@ -124,7 +125,7 @@ def safe_click(sb, selector, timeout=8):
             return True
         except Exception as e2:
             escaped_sel = selector.replace("'", "\\'")
-            clicked = dispatch_react_click(sb, f"document.querySelector('{escaped_sel}')")
+            clicked = dispatch_mouse_sequence(sb, f"document.querySelector('{escaped_sel}')")
             if clicked:
                 return True
             raise e2
@@ -167,25 +168,63 @@ def reset_turnstile_state(sb):
         } catch(e) {}
     """)
 
-# 页面注入脚本：获取 Turnstile token（优先检查可见弹窗内的 input，避免读到旧缓存）
-TURNSTILE_TOKEN_JS = """
-var dialogs = document.querySelectorAll('div[role="dialog"], .modal, [class*="modal"], [class*="dialog"]');
-for (var d = 0; d < dialogs.length; d++) {
-    var rect = dialogs[d].getBoundingClientRect();
-    if (rect.width > 50 && rect.height > 50) {
-        var modalInputs = dialogs[d].querySelectorAll('input[name="cf-turnstile-response"]');
-        if (modalInputs.length > 0) {
-            for (var m = 0; m < modalInputs.length; m++) {
-                if (modalInputs[m].value && modalInputs[m].value.length > 20) {
-                    return modalInputs[m].value;
-                }
+# 挂载 Fetch / XHR 拦截器，记录点击确认按钮后后端接口的真实返回状态与内容
+def install_network_sniffer(sb):
+    js(sb, """
+        try {
+            window.__renew_api_logs = [];
+            if (!window.__sniffer_installed) {
+                window.__sniffer_installed = true;
+                var origFetch = window.fetch;
+                window.fetch = async function() {
+                    var url = arguments[0] ? (typeof arguments[0] === 'string' ? arguments[0] : arguments[0].url) : '';
+                    try {
+                        var resp = await origFetch.apply(this, arguments);
+                        if (url && !url.includes('google') && !url.includes('cloudflare')) {
+                            var clone = resp.clone();
+                            clone.text().then(function(body) {
+                                window.__renew_api_logs.push('FETCH ' + resp.status + ' ' + url.slice(0, 80) + ' -> ' + (body || '').slice(0, 160));
+                            }).catch(function(){});
+                        }
+                        return resp;
+                    } catch (err) {
+                        window.__renew_api_logs.push('FETCH_ERR ' + url.slice(0, 80) + ' -> ' + String(err));
+                        throw err;
+                    }
+                };
+                var origOpen = XMLHttpRequest.prototype.open;
+                var origSend = XMLHttpRequest.prototype.send;
+                XMLHttpRequest.prototype.open = function(method, url) {
+                    this.__url = url || '';
+                    this.__method = method || '';
+                    return origOpen.apply(this, arguments);
+                };
+                XMLHttpRequest.prototype.send = function() {
+                    var self = this;
+                    this.addEventListener('load', function() {
+                        if (self.__url && !self.__url.includes('google') && !self.__url.includes('cloudflare')) {
+                            window.__renew_api_logs.push('XHR ' + self.status + ' ' + self.__method + ' ' + self.__url.slice(0, 80) + ' -> ' + (self.responseText || '').slice(0, 160));
+                        }
+                    });
+                    return origSend.apply(this, arguments);
+                };
             }
-            return '';
-        }
-    }
-}
+        } catch(e) {}
+    """)
+
+def dump_network_sniffer(sb):
+    logs = js(sb, "return (window.__renew_api_logs || []).join('\\n');", "")
+    if logs:
+        print("📡 捕获到后端网络请求日志:")
+        for line in str(logs).splitlines()[-10:]:
+            print("   [API] " + line)
+    else:
+        print("📡 未捕获到新的后端业务请求 (可能点击未触发事件)")
+
+# 页面注入脚本：获取 Turnstile token
+TURNSTILE_TOKEN_JS = """
 var els = document.querySelectorAll('input[name="cf-turnstile-response"]');
-for (var i = 0; i < els.length; i++) {
+for (var i = els.length - 1; i >= 0; i--) {
     if (els[i].value && els[i].value.length > 20) return els[i].value;
 }
 try {
@@ -212,7 +251,7 @@ TS_COORDS_JS = """
 function findWidget(root) {
     var els = root.querySelectorAll(
         'iframe[src*="challenges.cloudflare.com"], .cf-turnstile, [id*="cf-chl"]');
-    for (var i = 0; i < els.length; i++) {
+    for (var i = els.length - 1; i >= 0; i--) {
         var r = els[i].getBoundingClientRect();
         if (r.width > 50 && r.height > 20) return els[i];
     }
@@ -227,7 +266,7 @@ function findWidget(root) {
 }
 function boxFromTokenInput(root) {
     var els = root.querySelectorAll('input[name="cf-turnstile-response"]');
-    for (var i = 0; i < els.length; i++) {
+    for (var i = els.length - 1; i >= 0; i--) {
         var cur = els[i].parentElement;
         for (var k = 0; k < 6 && cur; k++) {
             var r = cur.getBoundingClientRect();
@@ -237,18 +276,7 @@ function boxFromTokenInput(root) {
     }
     return null;
 }
-var hit = null;
-var dialogs = document.querySelectorAll('div[role="dialog"], .modal, [class*="modal"], [class*="dialog"]');
-for (var d = 0; d < dialogs.length; d++) {
-    var dr = dialogs[d].getBoundingClientRect();
-    if (dr.width > 50 && dr.height > 50) {
-        hit = findWidget(dialogs[d]) || boxFromTokenInput(dialogs[d]);
-        if (hit) break;
-    }
-}
-if (!hit) {
-    hit = findWidget(document) || boxFromTokenInput(document);
-}
+var hit = findWidget(document) || boxFromTokenInput(document);
 if (!hit) return null;
 var hr = hit.getBoundingClientRect();
 return {cx: Math.round(hr.x + 30), cy: Math.round(hr.y + hr.height / 2)};
@@ -316,9 +344,11 @@ def click_screen_coords(sb, cx: int, cy: int):
         bar = int(parts[2] or 800) - int(parts[3] or 768)
         ax = int(cx) + sx
         ay = int(cy) + sy + bar
+        print(f"🖱️ 底层物理坐标点击 ({ax}, {ay}) [视口坐标: ({cx}, {cy})]")
         _xdotool_click(ax, ay)
         return True
-    except Exception:
+    except Exception as e:
+        print(f"⚠️ 底层物理坐标点击异常: {e}")
         return False
 
 def turnstile_token(sb) -> str:
@@ -432,7 +462,6 @@ def normalize_date(date_str: str) -> str:
         return date_str
     date_str = date_str.strip()
 
-    # 处理 YYYY/MM/DD 或 MM/DD/YYYY
     if '/' in date_str:
         parts = date_str.split('/')
         if len(parts) == 3:
@@ -441,13 +470,11 @@ def normalize_date(date_str: str) -> str:
             if len(parts[0]) == 4:   # YYYY/MM/DD
                 return f"{parts[0]}/{int(parts[1]):02d}/{int(parts[2]):02d}"
 
-    # 处理 YYYY-MM-DD
     if '-' in date_str:
         parts = date_str.split('-')
         if len(parts) == 3 and len(parts[0]) == 4:
             return f"{parts[0]}/{int(parts[1]):02d}/{int(parts[2]):02d}"
 
-    # 处理英文日期格式，例如 "14 Nov 2026" 或 "14 November 2026"
     for fmt in ("%d %b %Y", "%d %B %Y"):
         try:
             dt = datetime.strptime(date_str, fmt)
@@ -475,7 +502,7 @@ def extract_expiry_date(page_source: str) -> str:
             
     return None
 
-# 优先从 DOM 的 st-meta 元素提取到期日期 (不依赖页面语言)
+# 优先从 DOM 的 st-meta 元素提取到期日期
 def get_expiry_from_dom(sb) -> str:
     for selector in ['span.st-meta', '.st-meta', '[class*="st-meta"]']:
         try:
@@ -487,33 +514,42 @@ def get_expiry_from_dom(sb) -> str:
             pass
     return None
 
-# 检查当前是否有可见的续期弹窗
-def is_modal_open(sb) -> bool:
-    return js(sb, """
-        var dialogs = document.querySelectorAll('div[role="dialog"], .modal.show, .modal[style*="display: block"]');
-        for (var i = 0; i < dialogs.length; i++) {
-            var r = dialogs[i].getBoundingClientRect();
-            if (r.width > 100 && r.height > 80) return true;
-        }
-        return false;
-    """, False)
+# 定位弹窗内的确认续期按钮 (例如 "Renew for 4 days")，排除外部的 "Renew free plan"
+FIND_MODAL_BTN_JS = """
+var btns = document.querySelectorAll('button, [role="button"], input[type="submit"]');
+for (var i = btns.length - 1; i >= 0; i--) {
+    var b = btns[i];
+    var r = b.getBoundingClientRect();
+    if (r.width < 30 || r.height < 20) continue;
+    if (b.disabled || b.getAttribute('aria-disabled') === 'true' || b.classList.contains('disabled')) continue;
+    var txt = (b.innerText || b.textContent || '').trim();
+    var low = txt.toLowerCase();
+    // 排除外部触发按钮和取消按钮
+    if (low === 'renew free plan' || low.includes('cancel') || low.includes('close') || low.includes('see plans')) continue;
+    if (low.includes('renew for') || low.includes('extend') || low.includes('confirm') || (low.includes('renew') && low.includes('day'))) {
+        b.setAttribute('data-modal-renew-btn', '1');
+        return {
+            found: true,
+            text: txt,
+            cx: Math.round(r.left + r.width / 2),
+            cy: Math.round(r.top + r.height / 2)
+        };
+    }
+}
+return {found: false};
+"""
 
-# 点击弹窗内的确认续期按钮，并验证点击真正生效
-def click_modal_renew_button(sb, outer_btn_text="", timeout=25) -> bool:
-    # 先打印一下当前弹窗内的所有按钮状态，方便排查
+# 点击弹窗内的确认续期按钮，并循环验证弹窗按钮是否真正消失或请求是否发出
+def click_modal_renew_button(sb, timeout=25) -> bool:
     btn_diag = js(sb, """
         var info = [];
-        var dialogs = document.querySelectorAll('div[role="dialog"], .modal, [class*="modal"], [class*="dialog"]');
-        var root = dialogs.length > 0 ? dialogs : [document];
-        for (var i = 0; i < root.length; i++) {
-            var btns = root[i].querySelectorAll('button');
-            for (var j = 0; j < btns.length; j++) {
-                var b = btns[j];
-                var r = b.getBoundingClientRect();
-                if (r.width > 20 && r.height > 15) {
-                    var txt = (b.innerText || b.textContent || '').trim();
-                    info.push('[' + txt + '|disabled=' + b.disabled + '|cls=' + b.className + ']');
-                }
+        var btns = document.querySelectorAll('button');
+        for (var j = 0; j < btns.length; j++) {
+            var b = btns[j];
+            var r = b.getBoundingClientRect();
+            if (r.width > 15 && r.height > 15) {
+                var txt = (b.innerText || b.textContent || '').trim();
+                info.push('[' + txt + '|disabled=' + b.disabled + '|cls=' + b.className + ']');
             }
         }
         return info.join(', ');
@@ -521,111 +557,61 @@ def click_modal_renew_button(sb, outer_btn_text="", timeout=25) -> bool:
     print(f"🔎 当前可见按钮列表: {btn_diag}")
 
     deadline = time.time() + timeout
-    clicked_at_least_once = False
+    attempt = 0
 
     while time.time() < deadline:
         dismiss_overlays(sb)
+        target = js(sb, FIND_MODAL_BTN_JS, {"found": False})
 
-        # 如果已经点击过，且弹窗已关闭或页面出现了倒计时，说明续期请求已成功完成
-        if clicked_at_least_once:
-            if not is_modal_open(sb):
-                print("✅ 检测到续期弹窗已关闭，确认按钮点击已生效")
-                return True
-            page_txt = js(sb, "return document.body ? document.body.innerText : '';", "")
-            if re.search(r"(?:Renew in|Renewal cooldown)\s+\d{1,2}:\d{2}:\d{2}", page_txt, re.I):
-                print("✅ 页面已出现续期冷却倒计时，确认续期已生效")
-                return True
+        # 如果已经点击过，且弹窗里的 "Renew for 4 days" 按钮已经消失，说明弹窗已关闭
+        if attempt > 0 and (not target or not target.get("found")):
+            print("✅ 弹窗内确认按钮已消失，续期请求已提交！")
+            return True
 
-        # 在弹窗（或页面上新出现的确认区域）中寻找已解锁（非 disabled）的确认续期按钮
-        target_info = js(sb, """
-            function isTargetBtn(b, insideDialog) {
-                var r = b.getBoundingClientRect();
-                if (r.width < 30 || r.height < 20) return false;
-                if (b.disabled || b.getAttribute('aria-disabled') === 'true' || b.classList.contains('disabled')) {
-                    return false;
-                }
-                var txt = (b.innerText || b.textContent || '').trim().toLowerCase();
-                if (txt.includes('cancel') || txt.includes('close') || txt.includes('取消') || txt.includes('关闭')) {
-                    return false;
-                }
-                if (txt.includes('renew') || txt.includes('extend') || txt.includes('confirm') || txt.includes('continue') || txt.includes('续期') || txt.includes('确认')) {
-                    return true;
-                }
-                if (insideDialog && (b.type === 'submit' || b.classList.contains('btn-primary'))) {
-                    return true;
-                }
-                return false;
-            }
+        # 检查页面是否已经变成冷却倒计时
+        page_txt = js(sb, "return document.body ? document.body.innerText : '';", "")
+        if re.search(r"(?:Renew in|Renewal cooldown)\s+\d{1,2}:\d{2}:\d{2}", page_txt, re.I):
+            print("✅ 页面已出现续期冷却倒计时，确认续期已生效！")
+            return True
 
-            // 1. 优先在 role="dialog" 或 modal 容器内查找
-            var dialogs = document.querySelectorAll('div[role="dialog"], .modal, [class*="modal"], [class*="dialog"]');
-            for (var i = 0; i < dialogs.length; i++) {
-                var dr = dialogs[i].getBoundingClientRect();
-                if (dr.width < 80 || dr.height < 60) continue;
-                var btns = dialogs[i].querySelectorAll('button, input[type="submit"], [role="button"]');
-                for (var j = 0; j < btns.length; j++) {
-                    if (isTargetBtn(btns[j], true)) {
-                        var br = btns[j].getBoundingClientRect();
-                        btns[j].setAttribute('data-renew-target', '1');
-                        return {
-                            found: true,
-                            text: (btns[j].innerText || btns[j].textContent || '').trim(),
-                            cx: Math.round(br.left + br.width / 2),
-                            cy: Math.round(br.top + br.height / 2)
-                        };
-                    }
-                }
-            }
+        if target and target.get("found"):
+            attempt += 1
+            btn_text = target.get("text", "")
+            cx, cy = int(target.get("cx", 0)), int(target.get("cy", 0))
+            print(f"🖱️ [第 {attempt} 次尝试] 点击弹窗确认按钮 '{btn_text}' ({cx}, {cy})...")
 
-            // 2. 如果弹窗不是标准 role="dialog"，从 Turnstile 往上找最近的公共父容器里的按钮
-            var ts = document.querySelector('input[name="cf-turnstile-response"], iframe[src*="challenges.cloudflare.com"], .cf-turnstile');
-            if (ts) {
-                var cur = ts.parentElement;
-                for (var k = 0; k < 6 && cur && cur !== document.body; k++) {
-                    var cbtns = cur.querySelectorAll('button, input[type="submit"], [role="button"]');
-                    for (var m = 0; m < cbtns.length; m++) {
-                        if (isTargetBtn(cbtns[m], true)) {
-                            var cbr = cbtns[m].getBoundingClientRect();
-                            cbtns[m].setAttribute('data-renew-target', '1');
-                            return {
-                                found: true,
-                                text: (cbtns[m].innerText || cbtns[m].textContent || '').trim(),
-                                cx: Math.round(cbr.left + cbr.width / 2),
-                                cy: Math.round(cbr.top + cbr.height / 2)
-                            };
-                        }
-                    }
-                    cur = cur.parentElement;
-                }
-            }
-            return {found: false};
-        """, {"found": False})
-
-        if target_info and target_info.get("found"):
-            btn_text = target_info.get("text", "")
-            cx, cy = target_info.get("cx", 0), target_info.get("cy", 0)
-            print(f"🖱️ 定位到可用确认按钮 '{btn_text}' ({cx}, {cy})，执行点击...")
-
-            # 方式 1: SeleniumBase 常规点击
-            try:
-                sb.click('[data-renew-target="1"]', timeout=3)
-            except Exception:
-                pass
-
-            # 方式 2: 派发 React 合成事件点击
-            dispatch_react_click(sb, 'document.querySelector(\'[data-renew-target="1"]\')')
-
-            # 方式 3: 如果前面已经点过一次但弹窗没关，使用底层物理鼠标点击
-            if clicked_at_least_once and cx > 0 and cy > 0:
-                print(f"🖱️ 补充底层物理坐标点击确认按钮 ({cx}, {cy})...")
+            if attempt == 1:
+                # 第 1 次：底层物理鼠标点击 + SeleniumBase 常规点击
                 click_screen_coords(sb, cx, cy)
+                time.sleep(1)
+                try:
+                    if sb.is_element_visible('[data-modal-renew-btn="1"]'):
+                        sb.click('[data-modal-renew-btn="1"]', timeout=3)
+                except Exception:
+                    pass
+            elif attempt == 2:
+                # 第 2 次：CDP 坐标点击 + 合成事件派发 + 原生 click()
+                try:
+                    if hasattr(sb, "cdp") and hasattr(sb.cdp, "gui_click_x_y"):
+                        sb.cdp.gui_click_x_y(cx, cy)
+                except Exception:
+                    pass
+                dispatch_mouse_sequence(sb, 'document.querySelector(\'[data-modal-renew-btn="1"]\')')
+                js(sb, 'var b = document.querySelector(\'[data-modal-renew-btn="1"]\'); if(b) b.click();')
+            else:
+                # 第 3 次及以后：如果弹窗内 Turnstile 因为首次提交失败被重置，重新检查 Turnstile
+                if wait_turnstile_present(sb, timeout=3) and not turnstile_token(sb):
+                    print("🔄 检测到弹窗内 Turnstile 需要重新验证...")
+                    handle_turnstile(sb)
+                    time.sleep(2)
+                click_screen_coords(sb, cx, cy)
+                js(sb, 'var b = document.querySelector(\'[data-modal-renew-btn="1"]\'); if(b) b.click();')
 
-            clicked_at_least_once = True
-            time.sleep(3)
+            time.sleep(3.5)
         else:
             time.sleep(1)
 
-    return clicked_at_least_once
+    return attempt > 0
 
 # 主流程
 def main():
@@ -665,7 +651,7 @@ def main():
                 dismiss_overlays(sb)
 
                 safe_click(sb, 'button[type="submit"]') # 点击 Continue with email 按钮
-                sb.sleep(8)  # 等待页面加载
+                sb.sleep(8)
                 dismiss_overlays(sb)
 
                 print("📧 填写邮箱...")
@@ -686,9 +672,9 @@ def main():
                 else:
                     print("ℹ️ 未检测到 Turnstile")
                 sb.sleep(1)
-                safe_click(sb, 'button[type="submit"]') # 点击登录按钮
+                safe_click(sb, 'button[type="submit"]')
                 print("🖱️ 提交登录按钮")
-                sb.sleep(6)  # 等待页面加载
+                sb.sleep(6)
                 sb.wait_for_ready_state_complete()
                 
                 sb.open(f"{BASE_URL}/dash/billings")
@@ -715,6 +701,8 @@ def main():
         # 清理 GDPR 隐私遮罩弹窗并提取当前到期日期
         sb.sleep(2)
         dismiss_overlays(sb)
+        install_network_sniffer(sb)
+
         try:
             page_source = sb.get_page_text() + "\n" + sb.get_page_source()
         except Exception:
@@ -727,7 +715,6 @@ def main():
 
         # 寻找外部续期按钮
         outer_renew_selector = None
-        outer_btn_text = ""
         countdown_text = None
         possible_selectors = [
             'button:contains("Renew free plan")',
@@ -748,13 +735,11 @@ def main():
                         break
                     elif any(k in button_text for k in ("Renew", "Extend", "续期")):
                         outer_renew_selector = selector
-                        outer_btn_text = button_text
                         print(f"✅ 续期按钮可用: '{button_text}'")
                         break
             except Exception:
                 pass
 
-        # 如果页面文本中有冷却倒计时但按钮被禁用不可点，也做一次全局正则兜底
         if not outer_renew_selector and not countdown_text:
             m_cd = re.search(r"(?:Renew in|Renewal cooldown)\s+(\d{1,2}:\d{2}:\d{2})", page_source, re.I)
             if m_cd:
@@ -766,18 +751,15 @@ def main():
             print("🔄 点击外部续期按钮，等待验证窗口...")
             try:
                 sb.sleep(1)
-                # 彻底清空旧的 Turnstile 状态防止误判登录页残留状态
                 reset_turnstile_state(sb)
                 safe_click(sb, outer_renew_selector)
-                sb.sleep(6)  # 等待模态框和 Turnstile 组件渲染
+                sb.sleep(6)
             except Exception as e:
                 print(f"❌ 点击外部按钮失败: {e}")
                 send_telegram_message(format_notification("❌ 续期失败", error="点击外部续期按钮出错"))
                 return
 
-            # 再次清理刚刚可能生成的空 token 缓存，确保等待真实点击验证
             if wait_turnstile_present(sb, timeout=15):
-                # 等待 2 秒让 Turnstile iframe 完成初始化
                 sb.sleep(2)
                 turnstile_passed = handle_turnstile(sb)
                 if not turnstile_passed:
@@ -797,18 +779,19 @@ def main():
                 send_telegram_message(format_notification("❌ 续期失败", error="Turnstile 验证未通过"))
                 return
 
-            # 等待前端 Turnstile onSuccess 回调解锁确认按钮
             print("⏳ 等待弹窗内续期确认按钮解锁并点击...")
-            sb.sleep(3)
-            if click_modal_renew_button(sb, outer_btn_text=outer_btn_text, timeout=25):
+            sb.sleep(2)
+            if click_modal_renew_button(sb, timeout=25):
                 print("✅ 已完成弹窗内续期确认按钮点击流程")
             else:
-                print("⚠️ 未能定位或点击弹窗内确认按钮，可能点击外部按钮时已直接触发续期")
+                print("⚠️ 未能定位或点击弹窗内确认按钮")
+
+            sb.sleep(4)
+            dump_network_sniffer(sb)
 
             print("⏳ 等待后端处理并刷新页面获取最新到期时间...")
-            sb.sleep(8)
+            sb.sleep(5)
 
-            # 主动刷新账单页，确保拿到最新 DOM 数据
             try:
                 sb.open(f"{BASE_URL}/dash/billings")
                 sb.wait_for_ready_state_complete()
@@ -817,7 +800,6 @@ def main():
             except Exception as e:
                 print(f"⚠️ 刷新账单页面出错: {e}")
 
-            # 提取新的到期日期和倒计时
             try:
                 new_page_text = sb.get_page_text() + "\n" + sb.get_page_source()
             except Exception:
