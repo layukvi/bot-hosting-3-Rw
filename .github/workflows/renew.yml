@@ -23,7 +23,7 @@ jobs:
       - name: 🛠️ 安装系统依赖和 Python 依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb x11-utils xdotool scrot fonts-noto-cjk jq wget
+          sudo apt-get install -y xvfb x11-utils xdotool scrot fonts-noto-cjk jq wget curl
           pip install seleniumbase requests
           seleniumbase install chromedriver
 
@@ -31,8 +31,16 @@ jobs:
         continue-on-error: true
         env:
           NODE_LINK: ${{ secrets.NODE_LINK }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
+          if [ -n "$NODE_LINK" ]; then
+            # 注入 GitHub Token 防止 setup_proxy.sh 查询 sing-box 最新版本时触发 GitHub API 匿名限流导致 jq 报错退出
+            echo "header = \"Authorization: Bearer $GH_TOKEN\"" > ~/.curlrc
+            bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh) || true
+            rm -f ~/.curlrc
+          else
+            echo "ℹ️ 未配置 NODE_LINK，跳过代理设置"
+          fi
 
       - name: 🚀 运行续期脚本
         env:
@@ -50,7 +58,7 @@ jobs:
           pkill -f chromedriver || true
           pkill -f chrome || true
           pkill -f Xvfb || true
-          rm -f sing-box sing-box-config.json sing-box.log
+          rm -f sing-box sing-box-config.json sing-box.log ~/.curlrc
 
       - name: 🧹 清理旧的工作流运行记录
         if: always()
