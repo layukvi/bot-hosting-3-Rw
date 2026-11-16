@@ -57,6 +57,32 @@ def format_notification(status: str, extra: str = "", error: str = "", expiry_da
     lines.append(f"⏱️ 登录时间: {now}")
     return "\n".join(lines)
 
+# 将 sing-box 的纯 socks 入站升级为 mixed (同时支持 Chrome 的 HTTP 代理和 SOCKS5)
+def ensure_mixed_proxy():
+    cfg_path = "sing-box-config.json"
+    if not os.path.exists(cfg_path):
+        return
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        if re.search(r'"type"\s*:\s*"socks"', content):
+            print("🔧 将 sing-box 本地端口从纯 socks 升级为 mixed 混合模式 (兼容 Chrome HTTP 代理)...")
+            new_content = re.sub(r'"type"\s*:\s*"socks"', '"type": "mixed"', content)
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                f.write(new_content)
+            subprocess.run(["pkill", "-f", "sing-box"], stderr=subprocess.DEVNULL)
+            time.sleep(1)
+            sb_bin = "./sing-box" if os.path.exists("./sing-box") else "sing-box"
+            subprocess.Popen(
+                [sb_bin, "run", "-c", cfg_path],
+                stdout=open("sing-box.log", "a"),
+                stderr=subprocess.STDOUT,
+            )
+            time.sleep(2)
+            print("✅ sing-box mixed 代理已重启就绪")
+    except Exception as e:
+        print(f"⚠️ 升级 sing-box mixed 模式出错: {e}")
+
 # ---------- 基础工具 ----------
 def js(sb, script, default=None, errors=None):
     try:
@@ -73,13 +99,13 @@ def js(sb, script, default=None, errors=None):
                 errors.append(f"cdp.evaluate: {type(e2).__name__}: {e2}")
             return default
 
-# 清理 Google Funding Choices (GDPR Consent) 及广告遮罩弹窗
+# 清理 Google Funding Choices (GDPR Consent) 遮罩弹窗
 def dismiss_overlays(sb):
     js(sb, """
         try {
             var consentBtn = document.querySelector('.fc-cta-consent, button.fc-button.fc-cta-consent');
             if (consentBtn) { consentBtn.click(); }
-            var overlays = document.querySelectorAll('.fc-consent-root, .fc-dialog-overlay, .fc-dialog-container, ins.adsbygoogle[data-vignette-loaded="true"]');
+            var overlays = document.querySelectorAll('.fc-consent-root, .fc-dialog-overlay, .fc-dialog-container');
             overlays.forEach(function(el) { el.remove(); });
             if (document.body) {
                 document.body.style.overflow = 'auto';
@@ -101,41 +127,14 @@ def safe_click(sb, selector, timeout=8):
             sb.js_click(selector)
             return True
         except Exception as e2:
-            escaped_sel = selector.replace("'", "\\'")
             clicked = js(sb, f"""
-                var el = document.querySelector('{escaped_sel}');
+                var el = document.querySelector('{selector.replace("'", "\\'")}');
                 if (el) {{ el.click(); return true; }}
                 return false;
             """, False)
             if clicked:
                 return True
             raise e2
-
-# Turnstile 定位失败时的现场诊断快照
-def diag_turnstile_dom(sb, errors=None):
-    snap = js(sb, """
-        var out = [];
-        var ifr = document.querySelectorAll('iframe');
-        out.push('top-doc iframes: ' + ifr.length);
-        for (var i = 0; i < ifr.length; i++) {
-            var r = ifr[i].getBoundingClientRect();
-            out.push('iframe w=' + Math.round(r.width) + ' h=' + Math.round(r.height) + ' src=' + (ifr[i].src || '').slice(0, 90));
-        }
-        var ts = document.querySelectorAll('[class*="turnstile"], [id*="turnstile"], input[name="cf-turnstile-response"]');
-        out.push('turnstile-ish elements: ' + ts.length);
-        for (var j = 0; j < ts.length; j++) {
-            var rr = ts[j].getBoundingClientRect();
-            var cls = (typeof ts[j].className === 'string') ? ts[j].className : (ts[j].getAttribute('class') || '');
-            out.push(' - ' + ts[j].tagName + ' class=' + cls + ' w=' + Math.round(rr.width) + ' h=' + Math.round(rr.height));
-        }
-        out.push('window.turnstile=' + (typeof window.turnstile) + ' readyState=' + document.readyState);
-        return out.join('\\n');
-    """, "")
-    for line in str(snap).splitlines():
-        print("   [diag] " + line)
-    if errors:
-        for err in errors:
-            print("   [diag][exec-error] " + str(err)[:200])
 
 # 挂载 Fetch / XHR 拦截器，记录点击确认按钮后后端接口的真实返回状态与内容
 def install_network_sniffer(sb):
@@ -189,6 +188,32 @@ def dump_network_sniffer(sb):
             print("   [API] " + line)
     else:
         print("📡 暂未捕获到新的后端业务请求")
+
+# Turnstile 定位失败时的现场诊断快照
+def diag_turnstile_dom(sb, errors=None):
+    snap = js(sb, """
+        var out = [];
+        var ifr = document.querySelectorAll('iframe');
+        out.push('top-doc iframes: ' + ifr.length);
+        for (var i = 0; i < ifr.length; i++) {
+            var r = ifr[i].getBoundingClientRect();
+            out.push('iframe w=' + Math.round(r.width) + ' h=' + Math.round(r.height) + ' src=' + (ifr[i].src || '').slice(0, 90));
+        }
+        var ts = document.querySelectorAll('[class*="turnstile"], [id*="turnstile"], input[name="cf-turnstile-response"]');
+        out.push('turnstile-ish elements: ' + ts.length);
+        for (var j = 0; j < ts.length; j++) {
+            var rr = ts[j].getBoundingClientRect();
+            var cls = (typeof ts[j].className === 'string') ? ts[j].className : (ts[j].getAttribute('class') || '');
+            out.push(' - ' + ts[j].tagName + ' class=' + cls + ' w=' + Math.round(rr.width) + ' h=' + Math.round(rr.height));
+        }
+        out.push('window.turnstile=' + (typeof window.turnstile) + ' readyState=' + document.readyState);
+        return out.join('\\n');
+    """, "")
+    for line in str(snap).splitlines():
+        print("   [diag] " + line)
+    if errors:
+        for err in errors:
+            print("   [diag][exec-error] " + str(err)[:200])
 
 # 页面注入脚本
 TURNSTILE_TOKEN_JS = """
@@ -518,8 +543,6 @@ def click_modal_renew_button(sb, timeout=20) -> bool:
     print(f"🔎 当前可见按钮列表: {btn_diag}")
 
     deadline = time.time() + timeout
-    clicked = False
-
     while time.time() < deadline:
         dismiss_overlays(sb)
         target = js(sb, FIND_MODAL_BTN_JS, {"found": False})
@@ -527,19 +550,15 @@ def click_modal_renew_button(sb, timeout=20) -> bool:
         if target and target.get("found"):
             btn_text = target.get("text", "")
             cx, cy = int(target.get("cx", 0)), int(target.get("cy", 0))
-            print(f"🖱️ 定位到弹窗确认按钮 '{btn_text}' ({cx}, {cy})，执行单次点击...")
+            print(f"🖱️ 定位到弹窗确认按钮 '{btn_text}' ({cx}, {cy})，执行点击...")
 
-            # 优先使用常规单次点击 (不要并发派发多次点击，防止单次 Turnstile Token 重复提交失效)
             try:
                 sb.click('[data-modal-renew-btn="1"]', timeout=4)
-                clicked = True
             except Exception as e:
                 print(f"⚠️ 常规点击确认按钮异常，改用底层物理坐标点击: {str(e)[:80]}")
                 click_screen_coords(sb, cx, cy)
-                clicked = True
 
             time.sleep(4)
-            # 检查点击后是否发出了网络请求
             api_count = js(sb, "return (window.__renew_api_logs || []).length;", 0)
             if api_count == 0:
                 t2 = js(sb, FIND_MODAL_BTN_JS, {"found": False})
@@ -547,27 +566,34 @@ def click_modal_renew_button(sb, timeout=20) -> bool:
                     print("🖱️ 未检测到后端请求且按钮仍在，补充底层物理坐标点击...")
                     click_screen_coords(sb, int(t2.get("cx", cx)), int(t2.get("cy", cy)))
                     time.sleep(4)
+
+            modal_txt = js(sb, """
+                var d = document.querySelector('div[role="dialog"], .modal, [class*="modal"]');
+                return d ? (d.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 200) : '';
+            """, "")
+            if modal_txt:
+                print(f"📋 点击后弹窗内容状态: {modal_txt}")
             return True
 
         time.sleep(1)
 
-    return clicked
+    return False
 
-# 单次浏览器会话执行登录与续期，返回 (login_ok, finished)
+# 执行单次浏览器会话
 def run_session(use_proxy: bool, raw_proxy: str, headless: bool) -> bool:
     sb_kwargs = {"uc": True, "headless": headless, "locale_code": "en-US"}
 
     if use_proxy and raw_proxy:
-        # 关键修复：SeleniumBase 的 proxy 参数不支持 socks5:// 前缀，必须剥离协议头转为 127.0.0.1:1080
-        # sing-box 的 1080 端口为 mixed 模式，原生支持 Chrome 的 HTTP/HTTPS 代理请求
+        ensure_mixed_proxy()
         clean_proxy = re.sub(r"^[a-zA-Z0-9]+://", "", raw_proxy).strip()
-        print(f"🔗 挂载代理: {clean_proxy} (原始: {raw_proxy})")
+        print(f"🔗 挂载代理: {clean_proxy}")
         sb_kwargs["proxy"] = clean_proxy
         try:
             ip = get_current_ip(f"http://{clean_proxy}")
-            print(f"📍 当前出口IP: {ip}")
+            print(f"📍 当前代理出口IP: {ip}")
         except Exception as e:
-            print(f"⚠️ 获取代理出口 IP 失败: {e}")
+            print(f"⚠️ HTTP 代理连通性测试失败 ({e})，放弃代理模式")
+            return False
     else:
         print("🍭 未使用代理，直连访问")
         try:
@@ -583,29 +609,19 @@ def run_session(use_proxy: bool, raw_proxy: str, headless: bool) -> bool:
             print(f"🌐 访问 {BASE_URL}/login")
             sb.open(f"{BASE_URL}/login")
             sb.wait_for_ready_state_complete()
-            sb.sleep(4)
+            sb.sleep(3)
             dismiss_overlays(sb)
 
-            title = sb.get_title() or ""
-            print(f"📄 登录页初始 Title: {title}")
-
-            # 如果代理 IP 进登录页前遇到 Cloudflare 全屏五秒盾，先过盾
-            if "Just a moment" in title or (not sb.is_element_present('button[type="submit"]') and wait_turnstile_present(sb, timeout=5)):
+            # 如果遇到前置全屏 Cloudflare 盾，先过盾
+            if not sb.is_element_present('button[type="submit"]') and wait_turnstile_present(sb, timeout=5):
                 print("🛡️ 登录页检测到前置 Cloudflare 验证，先处理验证...")
                 handle_turnstile(sb)
                 sb.sleep(5)
                 dismiss_overlays(sb)
 
-            # 如果依然既没有提交按钮也没有邮箱框，说明代理连接异常
-            if not sb.is_element_present('button[type="submit"]') and not sb.is_element_present('input[type="email"]'):
-                print("❌ 登录页面元素未加载出来")
-                return False
-
-            # 如果邮箱输入框尚未显示，点击 Continue with email 按钮
-            if not sb.is_element_visible('input[type="email"]'):
-                safe_click(sb, 'button[type="submit"]')
-                sb.sleep(8)
-                dismiss_overlays(sb)
+            safe_click(sb, 'button[type="submit"]') # 点击 Continue with email 按钮
+            sb.sleep(10)  # 等待密码框加载
+            dismiss_overlays(sb)
 
             print("📧 填写邮箱...")
             sb.input('input[type="email"]', EMAIL)
@@ -626,7 +642,7 @@ def run_session(use_proxy: bool, raw_proxy: str, headless: bool) -> bool:
                 print("ℹ️ 未检测到 Turnstile")
 
             sb.sleep(1)
-            safe_click(sb, 'button[type="submit"]')
+            safe_click(sb, 'button[type="submit"]') # 点击登录按钮
             print("🖱️ 提交登录按钮")
             sb.sleep(6)
             sb.wait_for_ready_state_complete()
@@ -702,7 +718,6 @@ def run_session(use_proxy: bool, raw_proxy: str, headless: bool) -> bool:
             print("🔄 点击外部续期按钮，等待验证窗口...")
             try:
                 sb.sleep(1)
-                # 仅清空残留 input 值，不调用 turnstile.reset() 以免破坏 Svelte 组件绑定
                 js(sb, """
                     var els = document.querySelectorAll('input[name="cf-turnstile-response"]');
                     els.forEach(function(e){ e.value = ''; });
